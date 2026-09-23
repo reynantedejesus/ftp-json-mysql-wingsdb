@@ -437,7 +437,7 @@ def save_to_mysql(json_array_str: str, db_conn) -> Tuple[int, str]:
         INBOX_STATUS_NEW,                      # status
         now,                                   # inboxCreationDateTime
         IMPORT_SOURCE,                         # importSource
-        external_key,                          # externalKey
+        now,                                   # externalKey
         SYSTEM_VERSION_NUMBER,                 # systemVersionNumber
         now,                                   # lastImportDateTime
         FILE_ID,                               # file
