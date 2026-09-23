@@ -34,6 +34,9 @@ Usage (Rocky Linux 9)
     # 4. Provide credentials (see "Security notes" below) and run
     python sftp_json_to_mysql.py
 
+    # Only test the SFTP login and list the files (no MySQL, nothing moved)
+    python sftp_json_to_mysql.py --test-connection
+
     # Optional: verbose logging
     LOG_LEVEL=DEBUG python sftp_json_to_mysql.py
 
@@ -55,7 +58,8 @@ Security notes
         export SFTP_HOST="sftp-dev-edi.infinite.pl"
         export SFTP_PORT="10032"
         export SFTP_USER="wings_travel"
-        export SFTP_PASSWORD="********"
+        export SFTP_PASSWORD='********'   # single quotes if it contains $ ! or `
+        export SFTP_EXTRA_HOST_KEY_ALGORITHMS="ssh-rsa"  # = -o HostKeyAlgorithms=+ssh-rsa
         export SFTP_REMOTE_DIR="/response"
         export SFTP_PROCESSED_DIR="/response/processed"
 
@@ -84,11 +88,13 @@ Exit codes
     6  another instance is already running (lock held)
 """
 
+import argparse
 import fcntl
 import json
 import logging
 import os
 import posixpath
+import socket
 import stat
 import sys
 import uuid
@@ -108,7 +114,9 @@ SFTP_HOST = os.environ.get("SFTP_HOST", "sftp-dev-edi.infinite.pl")
 SFTP_PORT = int(os.environ.get("SFTP_PORT", "10032"))
 SFTP_USER = os.environ.get("SFTP_USER", "wings_travel")
 # WARNING: placeholder only - set SFTP_PASSWORD in the environment instead.
-SFTP_PASSWORD = os.environ.get("SFTP_PASSWORD", "xxxxxxx")
+# The script refuses to run while the password is still this placeholder.
+PLACEHOLDER_SFTP_PASSWORD = "xxxxxxx"
+SFTP_PASSWORD = os.environ.get("SFTP_PASSWORD", PLACEHOLDER_SFTP_PASSWORD)
 SFTP_REMOTE_DIR = os.environ.get("SFTP_REMOTE_DIR", "/response")
 SFTP_PROCESSED_DIR = os.environ.get("SFTP_PROCESSED_DIR", "/response/processed")
 SFTP_TIMEOUT_SECONDS = float(os.environ.get("SFTP_TIMEOUT_SECONDS", "30"))
@@ -119,6 +127,13 @@ SFTP_HOST_KEY_POLICY = os.environ.get("SFTP_HOST_KEY_POLICY", "autoadd").lower()
 SFTP_KNOWN_HOSTS = os.environ.get(
     "SFTP_KNOWN_HOSTS", os.path.expanduser("~/.ssh/known_hosts_wings_sftp")
 )
+# Extra host key algorithms to accept, like "sftp -o HostKeyAlgorithms=+ssh-rsa".
+# Comma separated; they are ADDED to paramiko's defaults, nothing is removed.
+SFTP_EXTRA_HOST_KEY_ALGORITHMS = [
+    a.strip()
+    for a in os.environ.get("SFTP_EXTRA_HOST_KEY_ALGORITHMS", "ssh-rsa").split(",")
+    if a.strip()
+]
 JSON_EXTENSION = ".json"
 JSON_FILE_ENCODING = "utf-8-sig"  # tolerates an optional UTF-8 BOM
 
@@ -270,47 +285,145 @@ def ensure_remote_dir(sftp: paramiko.SFTPClient, path: str) -> None:
 # =============================================================================
 # SFTP
 # =============================================================================
-def connect_sftp() -> Tuple[paramiko.SSHClient, paramiko.SFTPClient]:
-    """Open an SSH connection and return (ssh_client, sftp_client)."""
-    log.info("Connecting to SFTP %s@%s:%d", SFTP_USER, SFTP_HOST, SFTP_PORT)
-    ssh = paramiko.SSHClient()
-    ssh.load_system_host_keys()
-    if os.path.exists(SFTP_KNOWN_HOSTS):
-        ssh.load_host_keys(SFTP_KNOWN_HOSTS)
+def _known_hosts_name() -> str:
+    # Same format OpenSSH uses in known_hosts for non-standard ports.
+    return SFTP_HOST if SFTP_PORT == 22 else "[%s]:%d" % (SFTP_HOST, SFTP_PORT)
+
+
+def _verify_host_key(server_key: paramiko.PKey) -> None:
+    """Check the server's host key against known_hosts (like OpenSSH does)."""
+    host_keys = paramiko.HostKeys()
+    for path in (os.path.expanduser("~/.ssh/known_hosts"), SFTP_KNOWN_HOSTS):
+        if os.path.exists(path):
+            try:
+                host_keys.load(path)
+            except (IOError, paramiko.SSHException) as exc:
+                log.warning("Could not read known_hosts file %s: %s", path, exc)
+
+    name = _known_hosts_name()
+    key_type = server_key.get_name()
+    fingerprint = server_key.fingerprint
+    known = host_keys.lookup(name) or {}
+
+    if key_type in known:
+        if known[key_type] != server_key:
+            raise paramiko.BadHostKeyException(name, server_key, known[key_type])
+        log.debug("Host key for %s verified (%s %s)", name, key_type, fingerprint)
+        return
 
     if SFTP_HOST_KEY_POLICY == "reject":
-        ssh.set_missing_host_key_policy(paramiko.RejectPolicy())
-    elif SFTP_HOST_KEY_POLICY == "warn":
-        log.warning("SFTP host key verification is disabled (policy 'warn')")
-        ssh.set_missing_host_key_policy(paramiko.WarningPolicy())
-    else:
-        ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-
-    try:
-        ssh.connect(
-            hostname=SFTP_HOST,
-            port=SFTP_PORT,
-            username=SFTP_USER,
-            password=SFTP_PASSWORD,
-            timeout=SFTP_TIMEOUT_SECONDS,
-            banner_timeout=SFTP_TIMEOUT_SECONDS,
-            auth_timeout=SFTP_TIMEOUT_SECONDS,
-            allow_agent=False,
-            look_for_keys=False,
+        raise paramiko.SSHException(
+            "Host key for %s (%s %s) is not in %s and SFTP_HOST_KEY_POLICY=reject"
+            % (name, key_type, fingerprint, SFTP_KNOWN_HOSTS)
         )
-        if SFTP_HOST_KEY_POLICY not in ("reject", "warn"):
-            # Persist a newly trusted key so later runs verify it.
-            known_hosts_dir = os.path.dirname(SFTP_KNOWN_HOSTS)
-            if known_hosts_dir:
-                os.makedirs(known_hosts_dir, mode=0o700, exist_ok=True)
-            ssh.save_host_keys(SFTP_KNOWN_HOSTS)
-        sftp = ssh.open_sftp()
+    if SFTP_HOST_KEY_POLICY == "warn":
+        log.warning("Unknown host key for %s accepted without saving (%s %s)", name, key_type, fingerprint)
+        return
+
+    # "autoadd": trust on first use and remember the key.
+    log.warning("Adding new host key for %s to %s (%s %s)", name, SFTP_KNOWN_HOSTS, key_type, fingerprint)
+    known_hosts_dir = os.path.dirname(SFTP_KNOWN_HOSTS)
+    if known_hosts_dir:
+        os.makedirs(known_hosts_dir, mode=0o700, exist_ok=True)
+    own_keys = paramiko.HostKeys()
+    if os.path.exists(SFTP_KNOWN_HOSTS):
+        own_keys.load(SFTP_KNOWN_HOSTS)
+    own_keys.add(name, key_type, server_key)
+    own_keys.save(SFTP_KNOWN_HOSTS)
+
+
+def _authenticate(transport: paramiko.Transport) -> None:
+    """
+    Log in with the password, the way the OpenSSH ``sftp`` client does:
+    try "password" authentication and fall back to "keyboard-interactive"
+    (many SFTP servers only accept the password through the latter).
+    """
+    # Ask the server which methods it offers - very useful when debugging.
+    try:
+        transport.auth_none(SFTP_USER)
+        log.info("SFTP server accepted user %s without a password", SFTP_USER)
+        return
+    except paramiko.BadAuthenticationType as exc:
+        allowed = list(exc.allowed_types)
+    except paramiko.AuthenticationException:
+        allowed = ["password", "keyboard-interactive"]
+    log.info("SFTP server offers authentication methods: %s", ", ".join(allowed) or "(none)")
+
+    def answer_prompts(title, instructions, prompts):
+        if prompts:
+            log.debug("keyboard-interactive prompts: %s", [p[0] for p in prompts])
+        return [SFTP_PASSWORD for _ in prompts]
+
+    errors = []
+    if "password" in allowed:
+        try:
+            # fallback=False: keyboard-interactive is tried explicitly below.
+            transport.auth_password(SFTP_USER, SFTP_PASSWORD, fallback=False)
+            log.info("Authenticated as %s using 'password'", SFTP_USER)
+            return
+        except paramiko.AuthenticationException as exc:
+            errors.append("password: %s" % exc)
+    if "keyboard-interactive" in allowed:
+        try:
+            transport.auth_interactive(SFTP_USER, answer_prompts)
+            log.info("Authenticated as %s using 'keyboard-interactive'", SFTP_USER)
+            return
+        except paramiko.AuthenticationException as exc:
+            errors.append("keyboard-interactive: %s" % exc)
+
+    if not errors:
+        raise paramiko.AuthenticationException(
+            "Server does not offer password login for %s (offered: %s)"
+            % (SFTP_USER, ", ".join(allowed))
+        )
+    raise paramiko.AuthenticationException(
+        "Login rejected for user %s (%s). Check SFTP_USER / SFTP_PASSWORD."
+        % (SFTP_USER, "; ".join(errors))
+    )
+
+
+def connect_sftp() -> Tuple[paramiko.Transport, paramiko.SFTPClient]:
+    """Open an SSH connection and return (transport, sftp_client)."""
+    if not SFTP_PASSWORD or SFTP_PASSWORD == PLACEHOLDER_SFTP_PASSWORD:
+        raise JobError(
+            "SFTP_PASSWORD is not set (still the placeholder). Export it first, e.g. "
+            "export SFTP_PASSWORD='your-password'  (use single quotes if it contains $ ! or `)",
+            EXIT_GENERAL_ERROR,
+        )
+
+    log.info("Connecting to SFTP %s@%s:%d", SFTP_USER, SFTP_HOST, SFTP_PORT)
+    sock = socket.create_connection((SFTP_HOST, SFTP_PORT), timeout=SFTP_TIMEOUT_SECONDS)
+    transport = paramiko.Transport(sock)
+    try:
+        transport.banner_timeout = SFTP_TIMEOUT_SECONDS
+        transport.auth_timeout = SFTP_TIMEOUT_SECONDS
+
+        # Equivalent of: sftp -o HostKeyAlgorithms=+ssh-rsa
+        # Append the extra algorithms to paramiko's defaults (never remove any).
+        options = transport.get_security_options()
+        key_types = list(options.key_types)
+        for algo in SFTP_EXTRA_HOST_KEY_ALGORITHMS:
+            if algo not in key_types:
+                key_types.append(algo)
+        options.key_types = tuple(key_types)
+        log.debug("Accepted host key algorithms: %s", ", ".join(key_types))
+
+        transport.start_client(timeout=SFTP_TIMEOUT_SECONDS)
+        server_key = transport.get_remote_server_key()
+        log.info("SFTP server host key: %s %s", server_key.get_name(), server_key.fingerprint)
+        _verify_host_key(server_key)
+
+        _authenticate(transport)
+
+        sftp = paramiko.SFTPClient.from_transport(transport)
+        if sftp is None:
+            raise paramiko.SSHException("Server refused to open the SFTP subsystem")
         sftp.get_channel().settimeout(SFTP_TIMEOUT_SECONDS)
     except Exception:
-        ssh.close()
+        transport.close()
         raise
     log.info("SFTP connection established")
-    return ssh, sftp
+    return transport, sftp
 
 
 def list_json_files(sftp: paramiko.SFTPClient, remote_dir: str) -> List[str]:
@@ -465,14 +578,26 @@ def save_to_mysql(json_array_str: str, db_conn) -> Tuple[int, str]:
 # =============================================================================
 # Orchestration
 # =============================================================================
+def test_connection() -> int:
+    """Only connect to SFTP and list the JSON files - no MySQL, nothing moved."""
+    transport, sftp = connect_sftp()
+    try:
+        list_json_files(sftp, SFTP_REMOTE_DIR)
+    finally:
+        sftp.close()
+        transport.close()
+    log.info("SFTP connection test OK")
+    return EXIT_OK
+
+
 def run() -> int:
-    ssh: Optional[paramiko.SSHClient] = None
+    transport: Optional[paramiko.Transport] = None
     sftp: Optional[paramiko.SFTPClient] = None
     db_conn = None
     try:
         # 1. Connect to SFTP
         try:
-            ssh, sftp = connect_sftp()
+            transport, sftp = connect_sftp()
         except (paramiko.SSHException, OSError) as exc:
             raise JobError("SFTP connection failed: %s" % exc, EXIT_SFTP_ERROR)
 
@@ -533,21 +658,35 @@ def run() -> int:
                 log.debug("Error closing MySQL connection", exc_info=True)
         if sftp is not None:
             sftp.close()
-        if ssh is not None:
-            ssh.close()
+        if transport is not None:
+            transport.close()
             log.info("SFTP connection closed")
 
 
 def main() -> int:
+    parser = argparse.ArgumentParser(description="Import SFTP JSON files into MySQL.")
+    parser.add_argument(
+        "--test-connection",
+        action="store_true",
+        help="only log in to SFTP and list the JSON files (no MySQL, nothing is moved)",
+    )
+    args = parser.parse_args()
+
     setup_logging()
     log.info("=== SFTP JSON -> MySQL import started ===")
     lock = None
     try:
-        lock = acquire_lock(LOCK_FILE)
-        code = run()
+        if args.test_connection:
+            code = test_connection()
+        else:
+            lock = acquire_lock(LOCK_FILE)
+            code = run()
     except JobError as exc:
         log.error("%s", exc)
         code = exc.exit_code
+    except (paramiko.SSHException, OSError) as exc:
+        log.error("SFTP connection failed: %s", exc)
+        code = EXIT_SFTP_ERROR
     except Exception:
         log.exception("Unexpected error")
         code = EXIT_GENERAL_ERROR
