@@ -40,11 +40,30 @@ Usage (Rocky Linux 9)
     # Optional: verbose logging
     LOG_LEVEL=DEBUG python sftp_json_to_mysql.py
 
-    # Example cron entry (every 15 minutes), credentials in an env file
-    # that is only readable by the service user (chmod 600):
-    # */15 * * * * set -a; . /etc/wings-sftp-import.env; set +a; \
+    # Credentials are read automatically from a .env file (see ".env file"
+    # below): ENV_FILE=<path>, else .env next to the script, else ./.env
+    ENV_FILE=/etc/wings-sftp-import.env python sftp_json_to_mysql.py
+
+    # Example cron entry (every 15 minutes); the env file must be readable
+    # only by the service user (chmod 600):
+    # */15 * * * * ENV_FILE=/etc/wings-sftp-import.env \
     #   /opt/wings-sftp-import/venv/bin/python \
     #   /opt/wings-sftp-import/sftp_json_to_mysql.py >> /var/log/wings-sftp-import.log 2>&1
+
+-------------------------------------------------------------------------------
+.env file
+-------------------------------------------------------------------------------
+    Example contents (variable names must match exactly):
+
+        SFTP_USER=wings_travel
+        SFTP_PASSWORD='your-sftp-password'
+        MYSQL_HOST=127.0.0.1
+        MYSQL_PORT=3306
+        MYSQL_USER=wings_import
+        MYSQL_PASSWORD='your-mysql-password'
+        MYSQL_DATABASE=wings
+
+    Values already set in the real environment take precedence over the file.
 
 -------------------------------------------------------------------------------
 Security notes
@@ -53,7 +72,7 @@ Security notes
       placeholders only.
     * Prefer environment variables or a secrets manager (HashiCorp Vault,
       AWS Secrets Manager, systemd credentials, ...) over hard-coded values.
-    * Every setting below can be overridden by an environment variable:
+    * Every setting below can be set in the .env file or as an environment variable:
 
         export SFTP_HOST="sftp-dev-edi.infinite.pl"
         export SFTP_PORT="10032"
@@ -104,6 +123,69 @@ from typing import Any, List, Optional, Tuple
 import mysql.connector
 import paramiko
 from mysql.connector import Error as MySQLError
+
+# =============================================================================
+# .env FILE
+# =============================================================================
+# Settings are read from a .env file before the configuration below is built.
+# Search order (first existing file wins):
+#   1. the path in the ENV_FILE environment variable
+#   2. .env next to this script
+#   3. .env in the current working directory
+# Variables already set (non-empty) in the real environment are NOT overridden.
+# Format: KEY=value, one per line; "export KEY=value", quotes and # comments
+# are supported. Keep the file private: chmod 600 .env
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+
+
+def _parse_env_value(raw: str) -> str:
+    value = raw.strip()
+    if len(value) >= 2 and value[0] == value[-1] == "'":
+        return value[1:-1]  # single quotes: taken literally
+    if len(value) >= 2 and value[0] == value[-1] == '"':
+        inner = value[1:-1]
+        return (
+            inner.replace("\\\\", "\0").replace('\\"', '"').replace("\\n", "\n").replace("\0", "\\")
+        )
+    # unquoted: strip an inline " # comment"
+    hash_pos = value.find(" #")
+    if hash_pos != -1:
+        value = value[:hash_pos]
+    return value.strip()
+
+
+def load_env_file() -> Tuple[Optional[str], List[str]]:
+    """Load KEY=value pairs into os.environ. Returns (path, keys_loaded)."""
+    explicit = os.environ.get("ENV_FILE", "")
+    if explicit:
+        if not os.path.isfile(explicit):
+            raise SystemExit("ENV_FILE=%s does not exist or is not a file" % explicit)
+        candidates = [explicit]
+    else:
+        candidates = [os.path.join(SCRIPT_DIR, ".env"), os.path.join(os.getcwd(), ".env")]
+
+    for path in candidates:
+        if not os.path.isfile(path):
+            continue
+        loaded = []
+        with open(path, "r", encoding="utf-8-sig") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                if line.startswith("export "):
+                    line = line[len("export "):]
+                key, _, raw_value = line.partition("=")
+                key = key.strip()
+                # An empty exported variable does not hide the file's value.
+                if key and not os.environ.get(key):
+                    os.environ[key] = _parse_env_value(raw_value)
+                    loaded.append(key)
+        return path, loaded
+    return None, []
+
+
+ENV_FILE_PATH, ENV_FILE_KEYS = load_env_file()
 
 # =============================================================================
 # CONFIGURATION  --  edit here or (preferably) override via environment vars
@@ -386,8 +468,8 @@ def connect_sftp() -> Tuple[paramiko.Transport, paramiko.SFTPClient]:
     """Open an SSH connection and return (transport, sftp_client)."""
     if not SFTP_PASSWORD or SFTP_PASSWORD == PLACEHOLDER_SFTP_PASSWORD:
         raise JobError(
-            "SFTP_PASSWORD is not set (still the placeholder). Export it first, e.g. "
-            "export SFTP_PASSWORD='your-password'  (use single quotes if it contains $ ! or `)",
+            "SFTP_PASSWORD is not set (still the placeholder). Add SFTP_PASSWORD=... to %s, "
+            "or point ENV_FILE at your env file." % (ENV_FILE_PATH or os.path.join(SCRIPT_DIR, ".env")),
             EXIT_GENERAL_ERROR,
         )
 
@@ -674,6 +756,17 @@ def main() -> int:
 
     setup_logging()
     log.info("=== SFTP JSON -> MySQL import started ===")
+    if ENV_FILE_PATH:
+        # Only key names are logged, never values.
+        log.info("Loaded %d setting(s) from %s: %s",
+                 len(ENV_FILE_KEYS), ENV_FILE_PATH, ", ".join(ENV_FILE_KEYS) or "(none new)")
+        try:
+            if os.stat(ENV_FILE_PATH).st_mode & 0o077:
+                log.warning("%s is readable by other users - run: chmod 600 %s", ENV_FILE_PATH, ENV_FILE_PATH)
+        except OSError:
+            pass
+    else:
+        log.info("No .env file found (set ENV_FILE=/path/to/file to use one)")
     lock = None
     try:
         if args.test_connection:
