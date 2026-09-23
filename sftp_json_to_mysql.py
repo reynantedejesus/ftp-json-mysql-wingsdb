@@ -230,10 +230,10 @@ MYSQL_CONNECT_TIMEOUT_SECONDS = int(os.environ.get("MYSQL_CONNECT_TIMEOUT_SECOND
 
 # --- Values written to ext_externalApplicationInbox --------------------------
 INBOX_STATUS_NEW = 0                # status: 0 = new / not yet processed by the application
-IMPORT_SOURCE = 1                   # importSource: 1 = this SFTP JSON import job
+IMPORT_SOURCE = 16                  # importSource: 1 = this SFTP JSON import job
 SYSTEM_VERSION_NUMBER = "1.0.0"     # systemVersionNumber: version of this importer
-FILE_ID = 0                         # file: 0 (schema default, no linked file record)
-EXTERNAL_APPLICATION_INSTANCE = 0   # externalApplicationInstance
+FILE_ID = null                      # file: 0 (schema default, no linked file record)
+EXTERNAL_APPLICATION_INSTANCE = 279 # externalApplicationInstance
 EXTERNAL_APP_INSTANCES_TO_LINK_TYPE = 0  # externalApplicationInstancesToLinkType
 # creationDateInExternalSystem: "null" -> store NULL, "today" -> store today's date
 CREATION_DATE_IN_EXTERNAL_SYSTEM_MODE = os.environ.get(
